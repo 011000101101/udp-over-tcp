@@ -10,6 +10,14 @@ categories = ["command-line-utilities", "network-programming"]
 rust-version = "1.70.0"
 license = "MIT OR Apache-2.0"
 
+[lib]
+name = "udp_over_tcp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "udp-over-tcp"
+path = "src/main.rs"
+
 [workspace]
 
 [dependencies]
