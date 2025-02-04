@@ -24,8 +24,9 @@ pub async fn run(
     listen: bool,
     tcp_addr: SocketAddr,
     udp_bind: SocketAddr,
-    udp_sendto: SocketAddr,
+    initial_udp_sendto: SocketAddr,
 ) -> eyre::Result<()> {
+    let mut udp_sendto: SocketAddr = initial_udp_sendto;
     tracing::debug!("bind to udp {udp_bind:?}");
     let udp = tokio::net::UdpSocket::bind(udp_bind)
         .await
@@ -102,9 +103,14 @@ pub async fn run(
                 }
                 tcp_buf.clear();
             }
-            msg = udp.recv_buf(&mut udp_buf) => {
+            res = udp.recv_from(&mut udp_buf) => {
                 if let Some(tcp_stream) = &mut tcp {
-                    let _ = msg.expect("UdpSocket::recv_from has no relevant error conditions");
+                    let res = res.expect("UdpSocket::recv_from has no relevant error conditions");
+                    let source_address: SocketAddr = res.1;
+                    if source_address != udp_sendto {
+                        tracing::debug!("received udp packet from different source address: {}. setting as new UDP peer.", source_address);
+                    }
+                    udp_sendto = source_address;
                     let len = udp_buf.len() as u32;
                     tracing::trace!(n = len, "forward udp packet to tcp");
                     if let Err(e) = tcp_stream.write_all_buf(&mut Buf::chain(&len.to_le_bytes()[..], &udp_buf[..])).await {
