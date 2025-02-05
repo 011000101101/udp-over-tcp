@@ -6,8 +6,10 @@ use std::time::Duration;
 
 use bimap::BiMap;
 use bincode::{config, Decode, Encode};
+use bytes::Buf;
 use elsa::FrozenMap;
 use lexopt::ValueExt;
+use serde::__private::from_utf8_lossy;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::select;
@@ -201,8 +203,9 @@ impl UdpToTcp {
                             target_port: recv_sock.local_port,
                         };
                         let bytes = bincode::encode_to_vec(&udp_packet, config).unwrap();
+                        let len = bytes.len();
                         tracing::debug!("forward udp packet to tcp");
-                        if let Err(e) = tcp_stream.write_all(&bytes).await {
+                        if let Err(e) = tcp_stream.write_all_buf(&mut Buf::chain(&len.to_le_bytes()[..], &bytes[..])).await {
                             tracing::error!("dropping tcp connection after failed write: {e}");
                             tcp = None;
                         } else if let Err(e) = tcp_stream.flush().await {
@@ -225,10 +228,12 @@ impl UdpToTcp {
 
                     let mut rest = &tcp_buf[..];
                     loop {
+                        tracing::debug!("recv buffer: {}", from_utf8_lossy(rest));
                         if rest.len() < std::mem::size_of::<u32>() {
                             break;
                         }
                         let len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+                        tracing::debug!(num_bytes = len, "forward tcp packet to udp");
                         let tail = &rest[4..];
                         if tail.len() < len {
                             break;
