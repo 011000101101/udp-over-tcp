@@ -203,7 +203,7 @@ impl UdpToTcp {
                             target_port: recv_sock.local_port,
                         };
                         let bytes = bincode::encode_to_vec(&udp_packet, config).unwrap();
-                        let len = bytes.len();
+                        let len: u32 = bytes.len() as u32;
                         tracing::debug!("forward udp packet to tcp");
                         // if let Err(e) = tcp_stream.write_all_buf(&mut Buf::chain(&len.to_le_bytes()[..], &bytes[..])).await {
                         if let Err(e) = tcp_stream.write_all_buf(&mut Buf::chain(&len.to_le_bytes()[..], &len.to_le_bytes()[..])).await {
@@ -242,7 +242,7 @@ impl UdpToTcp {
                         }
                         // let msg = &tail[..len];
                         // let (udp_packet, _len): (UdpPacketWrapper, usize)  = bincode::decode_from_slice(msg, config).unwrap();
-                        // rest = &tail[len..];
+                        rest = &tail[4..];
                         // let send_sock = if self.nat_table.contains_right(&udp_packet.source_addr) {
                         //      self.udp_source_sockets.get(self.nat_table.get_by_right(&udp_packet.source_addr).unwrap()).unwrap() } else {
                         //         let udp_sock_tmp = UdpSocket::bind(SocketAddr::new(self.udp_ip_bind, udp_packet.source_addr.port())).await.unwrap_or(UdpSocket::bind(SocketAddr::new(self.udp_ip_bind, 0)).await.unwrap());
