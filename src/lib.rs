@@ -201,7 +201,7 @@ impl UdpToTcp {
                             target_port: recv_sock.local_port,
                         };
                         let bytes = bincode::encode_to_vec(&udp_packet, config).unwrap();
-                        tracing::trace!("forward udp packet to tcp");
+                        tracing::debug!("forward udp packet to tcp");
                         if let Err(e) = tcp_stream.write_all(&bytes).await {
                             tracing::error!("dropping tcp connection after failed write: {e}");
                             tcp = None;
@@ -243,14 +243,14 @@ impl UdpToTcp {
                                 self.nat_table.insert(local_port, udp_packet.source_addr);
                                 self.udp_source_sockets.get(&local_port).unwrap()
                         };
-                        tracing::trace!(n = len, "forward tcp packet to udp");
+                        tracing::debug!(n = len, "forward tcp packet to udp");
                         send_sock.send_to(&udp_packet.data, SocketAddr::new(self.udp_ip_peer, udp_packet.target_port)).await;
                     }
 
                     if rest.is_empty() {
                         tcp_buf.clear();
                     } else {
-                        tracing::trace!(n = rest.len(), "bytes left over in tcp receive buffer");
+                        tracing::debug!(n = rest.len(), "bytes left over in tcp receive buffer");
                         let keep = tcp_buf.len() - rest.len();
                         tcp_buf.drain(..keep);
                     }
