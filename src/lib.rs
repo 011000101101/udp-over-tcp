@@ -1,12 +1,17 @@
 use std::ffi::OsString;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Buf;
+use bimap::BiMap;
+use bincode::{config, Decode, Encode};
+use elsa::FrozenMap;
 use lexopt::ValueExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UdpSocket;
 use tokio::select;
+use tokio::task::JoinSet;
 
 pub fn port_or_addr(arg: OsString, default_addr: Ipv4Addr) -> eyre::Result<SocketAddr> {
     match arg.parse::<SocketAddr>() {
@@ -20,143 +25,235 @@ pub fn port_or_addr(arg: OsString, default_addr: Ipv4Addr) -> eyre::Result<Socke
     }
 }
 
-pub async fn run(
+#[derive(Encode, Decode)]
+struct UdpPacketWrapper {
+    data: Vec<u8>,
+    /// source port before NAT mapping -> perform mapping at UDP sender to avoid port conflicts
+    source_addr: SocketAddr,
+    /// original target port
+    target_port: u16,
+}
+
+#[derive(Clone)]
+struct UdpSockAccessor {
+    local_port: u16,
+    sock: Arc<UdpSocket>,
+}
+
+impl UdpSockAccessor {
+    pub fn new(sock: UdpSocket) -> (Self, Vec<u8>) {
+        (
+            UdpSockAccessor {
+                local_port: sock.local_addr().unwrap().port(),
+                sock: Arc::new(sock),
+            },
+            Vec::with_capacity(65536),
+        )
+    }
+
+    pub async fn recv_from(self, mut buf: Vec<u8>) -> (Self, Vec<u8>, usize, SocketAddr) {
+        let (len, source_addr) = self
+            .sock
+            .recv_from(&mut buf)
+            .await
+            .expect("UdpSocket::recv_from has no relevant error conditions");
+        (self, buf, len, source_addr)
+    }
+
+    pub async fn send_to(&self, payload: &[u8], addr: SocketAddr) -> usize {
+        self.sock.send_to(payload, addr).await.unwrap_or_else(|e| {
+            tracing::error!("udp forward failed: {e}");
+            0
+        })
+    }
+}
+
+pub struct UdpToTcp {
     listen: bool,
     tcp_addr: SocketAddr,
-    udp_bind: SocketAddr,
-    initial_udp_sendto: SocketAddr,
-) -> eyre::Result<()> {
-    let mut udp_sendto: SocketAddr = initial_udp_sendto;
-    tracing::debug!("bind to udp {udp_bind:?}");
-    let udp = tokio::net::UdpSocket::bind(udp_bind)
-        .await
-        .expect("udp-bind");
-    let mut listener = if listen {
-        tracing::info!("bind to tcp {tcp_addr:?}");
-        Some(
-            tokio::net::TcpListener::bind(tcp_addr)
-                .await
-                .expect("tcp-listen"),
-        )
-    } else {
-        None
-    };
-    let mut tcp = None::<tokio::net::TcpStream>;
-    let mut connect_again = None::<Pin<Box<tokio::time::Sleep>>>;
+    udp_ip_bind: IpAddr,
+    udp_ip_peer: IpAddr,
+    nat_table: BiMap<u16, SocketAddr>,
+    udp_source_sockets: FrozenMap<u16, Box<UdpSockAccessor>>,
+    udp_recv_socks: Option<JoinSet<(UdpSockAccessor, Vec<u8>, usize, SocketAddr)>>,
+}
 
-    let mut udp_buf = Vec::with_capacity(65536);
-    let mut tcp_buf = Vec::with_capacity(65536);
+impl UdpToTcp {
+    pub fn new(
+        listen: bool,
+        tcp_addr: SocketAddr,
+        udp_bind: SocketAddr,
+        initial_udp_sendto: SocketAddr,
+    ) -> Self {
+        UdpToTcp {
+            listen,
+            tcp_addr,
+            udp_ip_bind: udp_bind.ip(),
+            udp_ip_peer: initial_udp_sendto.ip(),
+            nat_table: BiMap::<u16, SocketAddr>::new(),
+            udp_source_sockets: FrozenMap::new(),
+            udp_recv_socks: Some(JoinSet::new()),
+        }
+    }
 
-    loop {
-        let has_tcp = tcp.is_some();
-        let connect_fut = async {
-            if !has_tcp && !listen {
-                if let Some(timeout) = &mut connect_again {
-                    timeout.await;
-                    connect_again = None;
-                }
+    fn add_udp_sock(
+        &self,
+        sock: UdpSocket,
+        udp_receivers: &mut JoinSet<(UdpSockAccessor, Vec<u8>, usize, SocketAddr)>,
+    ) -> u16 {
+        let (udp_sock, udp_buf) = UdpSockAccessor::new(sock);
+        let port = udp_sock.local_port;
+        let udp_sock_recv = udp_sock.clone();
+        self.udp_source_sockets.insert(port, Box::new(udp_sock));
+        // generate new receive future to monitor created port for incoming packets
+        udp_receivers.spawn(udp_sock_recv.recv_from(udp_buf));
+        port
+    }
 
-                tracing::debug!("connect to tcp {tcp_addr:?}");
-                tokio::net::TcpStream::connect(tcp_addr).await
-            } else {
-                std::future::pending().await
-            }
+    fn take_udp_receivers(&mut self) -> JoinSet<(UdpSockAccessor, Vec<u8>, usize, SocketAddr)> {
+        self.udp_recv_socks.take().unwrap()
+    }
+
+    pub async fn run(&mut self, udp_bind: SocketAddr) -> eyre::Result<()> {
+        let config = config::standard();
+        let mut listener = if self.listen {
+            tracing::info!("bind to tcp {:?}", self.tcp_addr);
+            Some(
+                tokio::net::TcpListener::bind(self.tcp_addr)
+                    .await
+                    .expect("tcp-listen"),
+            )
+        } else {
+            None
         };
-        let listener_fut = async {
-            if let Some(listener) = &mut listener {
-                listener.accept().await
-            } else {
-                std::future::pending().await
-            }
-        };
-        let tcp_fut = async {
-            if let Some(tcp) = &mut tcp {
-                tcp.read_buf(&mut tcp_buf).await
-            } else {
-                std::future::pending().await
-            }
-        };
+        let mut tcp = None::<tokio::net::TcpStream>;
+        let mut connect_again = None::<Pin<Box<tokio::time::Sleep>>>;
+        let mut tcp_buf = Vec::with_capacity(65536);
 
-        select! {
-            conn = connect_fut, if !has_tcp && !listen => {
-                match conn {
-                    Ok(stream) => {
-                        tracing::info!("established tcp connection");
-                        tcp = Some(stream);
-                        tcp_buf.clear();
+        tracing::debug!("bind to initial udp {udp_bind:?}");
+        let udp_initial = UdpSocket::bind(udp_bind).await.expect("udp-bind");
+
+        let mut udp_receivers = self.take_udp_receivers();
+        self.add_udp_sock(udp_initial, &mut udp_receivers);
+
+        loop {
+            let has_tcp = tcp.is_some();
+            let connect_fut = async {
+                if !has_tcp && !self.listen {
+                    if let Some(timeout) = &mut connect_again {
+                        timeout.await;
+                        connect_again = None;
                     }
-                    Err(e) => {
-                        tracing::error!("tcp connect failed: {e}");
-                        connect_again = Some(Box::pin(tokio::time::sleep(Duration::from_secs(1))));
-                    }
-                }
-            }
-            conn = listener_fut, if listen => {
-                let (conn, addr) = conn.expect("TcpListener::accept only fails if out of FDs or on protocol errors");
-                if let Some(old) = tcp.replace(conn) {
-                    tracing::warn!(
-                        "new tcp connection from {addr:?} replaces old {:?}",
-                        old.peer_addr().expect("TcpStream::peer_addr never fails")
-                    );
+
+                    tracing::debug!("connect to tcp {:?}", self.tcp_addr);
+                    tokio::net::TcpStream::connect(self.tcp_addr).await
                 } else {
-                    tracing::info!("accepted incoming tcp connection from {addr:?}");
+                    std::future::pending().await
                 }
-                tcp_buf.clear();
-            }
-            res = udp.recv_from(&mut udp_buf) => {
-                if let Some(tcp_stream) = &mut tcp {
-                    let res = res.expect("UdpSocket::recv_from has no relevant error conditions");
-                    let source_address: SocketAddr = res.1;
-                    if source_address != udp_sendto {
-                        tracing::debug!("received udp packet from different source address: {}. setting as new UDP peer.", source_address);
-                    }
-                    udp_sendto = source_address;
-                    let len = udp_buf.len() as u32;
-                    tracing::trace!(n = len, "forward udp packet to tcp");
-                    if let Err(e) = tcp_stream.write_all_buf(&mut Buf::chain(&len.to_le_bytes()[..], &udp_buf[..])).await {
-                        tracing::error!("dropping tcp connection after failed write: {e}");
-                        tcp = None;
-                    } else if let Err(e) = tcp_stream.flush().await {
-                        tracing::error!("dropping tcp connection after failed flush: {e}");
-                        tcp = None;
-                    }
-                    udp_buf.clear();
+            };
+            let listener_fut = async {
+                if let Some(listener) = &mut listener {
+                    listener.accept().await
                 } else {
-                    tracing::debug!("dropping udp packet without a tcp peer");
+                    std::future::pending().await
                 }
-            }
-            msg = tcp_fut => {
-                let n = msg.expect("tcp-read");
-                if n == 0 {
-                    tracing::warn!("dropping disconnected tcp connection");
-                    tcp = None;
-                    continue;
+            };
+            let tcp_fut = async {
+                if let Some(tcp) = &mut tcp {
+                    tcp.read_buf(&mut tcp_buf).await
+                } else {
+                    std::future::pending().await
                 }
+            };
 
-                let mut rest = &tcp_buf[..];
-                loop {
-                    if rest.len() < std::mem::size_of::<u32>() {
-                        break;
-                    }
-                    let len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
-                    let tail = &rest[4..];
-                    if tail.len() < len {
-                        break;
-                    }
-                    let msg = &tail[..len];
-                    rest = &tail[len..];
-                    tracing::trace!(n = len, "forward tcp packet to udp");
-                    if let Err(e) = udp.send_to(msg, udp_sendto).await {
-                        tracing::error!("udp forward failed: {e}");
+            select! {
+                conn = connect_fut, if !has_tcp && !self.listen => {
+                    match conn {
+                        Ok(stream) => {
+                            tracing::info!("established tcp connection");
+                            tcp = Some(stream);
+                            tcp_buf.clear();
+                        }
+                        Err(e) => {
+                            tracing::error!("tcp connect failed: {e}");
+                            connect_again = Some(Box::pin(tokio::time::sleep(Duration::from_secs(1))));
+                        }
                     }
                 }
-
-                if rest.is_empty() {
+                conn = listener_fut, if self.listen => {
+                    let (conn, addr) = conn.expect("TcpListener::accept only fails if out of FDs or on protocol errors");
+                    if let Some(old) = tcp.replace(conn) {
+                        tracing::warn!(
+                            "new tcp connection from {addr:?} replaces old {:?}",
+                            old.peer_addr().expect("TcpStream::peer_addr never fails")
+                        );
+                    } else {
+                        tracing::info!("accepted incoming tcp connection from {addr:?}");
+                    }
                     tcp_buf.clear();
-                } else {
-                    tracing::trace!(n = rest.len(), "bytes left over in tcp receive buffer");
-                    let keep = tcp_buf.len() - rest.len();
-                    tcp_buf.drain(..keep);
+                }
+                Some(res) = udp_receivers.join_next() => {
+                    let (recv_sock, mut buf, _len, source_addr): (UdpSockAccessor, Vec<u8>, usize, SocketAddr) = res.unwrap();
+                    if let Some(tcp_stream) = &mut tcp {
+                        let udp_packet = UdpPacketWrapper{
+                            data: buf.to_vec(),
+                            source_addr,
+                            target_port: recv_sock.local_port,
+                        };
+                        let bytes = bincode::encode_to_vec(&udp_packet, config).unwrap();
+                        tracing::trace!("forward udp packet to tcp");
+                        if let Err(e) = tcp_stream.write_all(&bytes).await {
+                            tracing::error!("dropping tcp connection after failed write: {e}");
+                            tcp = None;
+                        } else if let Err(e) = tcp_stream.flush().await {
+                            tracing::error!("dropping tcp connection after failed flush: {e}");
+                            tcp = None;
+                        }
+                        buf.clear();
+                    } else {
+                        tracing::debug!("dropping udp packet without a tcp peer");
+                    }
+                    udp_receivers.spawn(recv_sock.recv_from(buf));
+                }
+                msg = tcp_fut => {
+                    let n = msg.expect("tcp-read");
+                    if n == 0 {
+                        tracing::warn!("dropping disconnected tcp connection");
+                        tcp = None;
+                        continue;
+                    }
+
+                    let mut rest = &tcp_buf[..];
+                    loop {
+                        if rest.len() < std::mem::size_of::<u32>() {
+                            break;
+                        }
+                        let len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+                        let tail = &rest[4..];
+                        if tail.len() < len {
+                            break;
+                        }
+                        let msg = &tail[..len];
+                        let (udp_packet, _len): (UdpPacketWrapper, usize)  = bincode::decode_from_slice(msg, config).unwrap();
+                        rest = &tail[len..];
+                        let send_sock = if self.nat_table.contains_right(&udp_packet.source_addr) {
+                             self.udp_source_sockets.get(self.nat_table.get_by_right(&udp_packet.source_addr).unwrap()).unwrap() } else {
+                                let udp_sock_tmp = UdpSocket::bind(SocketAddr::new(self.udp_ip_bind, udp_packet.source_addr.port())).await.unwrap_or(UdpSocket::bind(SocketAddr::new(self.udp_ip_bind, 0)).await.unwrap());
+                                let local_port = self.add_udp_sock(udp_sock_tmp, &mut udp_receivers);
+                                self.nat_table.insert(local_port, udp_packet.source_addr);
+                                self.udp_source_sockets.get(&local_port).unwrap()
+                        };
+                        tracing::trace!(n = len, "forward tcp packet to udp");
+                        send_sock.send_to(&udp_packet.data, SocketAddr::new(self.udp_ip_peer, udp_packet.target_port)).await;
+                    }
+
+                    if rest.is_empty() {
+                        tcp_buf.clear();
+                    } else {
+                        tracing::trace!(n = rest.len(), "bytes left over in tcp receive buffer");
+                        let keep = tcp_buf.len() - rest.len();
+                        tcp_buf.drain(..keep);
+                    }
                 }
             }
         }

@@ -3,7 +3,7 @@ use std::net::Ipv4Addr;
 use eyre::WrapErr;
 use lexopt::prelude::*;
 
-use udp_over_tcp::{port_or_addr, run};
+use udp_over_tcp::{port_or_addr, UdpToTcp};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> eyre::Result<()> {
@@ -75,7 +75,9 @@ async fn main() -> eyre::Result<()> {
         eyre::bail!("no udp forward destination given");
     };
 
-    run(listen, tcp_addr, udp_bind, udp_sendto).await
+    let mut udp_to_tcp = UdpToTcp::new(listen, tcp_addr, udp_bind, udp_sendto);
+
+    udp_to_tcp.run(udp_bind).await
 }
 
 fn usage(exit_with: i32) -> ! {
