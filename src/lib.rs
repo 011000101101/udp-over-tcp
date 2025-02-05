@@ -27,7 +27,7 @@ pub fn port_or_addr(arg: OsString, default_addr: Ipv4Addr) -> eyre::Result<Socke
     }
 }
 
-#[derive(Encode, Decode)]
+#[derive(Encode, Decode, Debug)]
 struct UdpPacketWrapper {
     data: Vec<u8>,
     /// source port before NAT mapping -> perform mapping at UDP sender to avoid port conflicts
@@ -250,7 +250,7 @@ impl UdpToTcp {
                                 self.nat_table.insert(local_port, udp_packet.source_addr);
                                 self.udp_source_sockets.get(&local_port).unwrap()
                         };
-                        tracing::debug!(n = len, "forward tcp packet to udp");
+                        tracing::debug!(n = len, "forward tcp packet to udp: {:?}", udp_packet);
                         send_sock.send_to(&udp_packet.data, SocketAddr::new(self.udp_ip_peer, udp_packet.target_port)).await;
                     }
 
