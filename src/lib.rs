@@ -205,7 +205,8 @@ impl UdpToTcp {
                         let bytes = bincode::encode_to_vec(&udp_packet, config).unwrap();
                         let len = bytes.len();
                         tracing::debug!("forward udp packet to tcp");
-                        if let Err(e) = tcp_stream.write_all_buf(&mut Buf::chain(&len.to_le_bytes()[..], &bytes[..])).await {
+                        // if let Err(e) = tcp_stream.write_all_buf(&mut Buf::chain(&len.to_le_bytes()[..], &bytes[..])).await {
+                        if let Err(e) = tcp_stream.write_all_buf(&mut Buf::chain(&len.to_le_bytes()[..], &len.to_le_bytes()[..])).await {
                             tracing::error!("dropping tcp connection after failed write: {e}");
                             tcp = None;
                         } else if let Err(e) = tcp_stream.flush().await {
@@ -229,6 +230,7 @@ impl UdpToTcp {
                     let mut rest = &tcp_buf[..];
                     loop {
                         tracing::debug!("recv buffer: {}", from_utf8_lossy(rest));
+                        tracing::debug!("recv buffer bin: {:?}", rest);
                         if rest.len() < std::mem::size_of::<u32>() {
                             break;
                         }
@@ -238,18 +240,18 @@ impl UdpToTcp {
                         if tail.len() < len {
                             break;
                         }
-                        let msg = &tail[..len];
-                        let (udp_packet, _len): (UdpPacketWrapper, usize)  = bincode::decode_from_slice(msg, config).unwrap();
-                        rest = &tail[len..];
-                        let send_sock = if self.nat_table.contains_right(&udp_packet.source_addr) {
-                             self.udp_source_sockets.get(self.nat_table.get_by_right(&udp_packet.source_addr).unwrap()).unwrap() } else {
-                                let udp_sock_tmp = UdpSocket::bind(SocketAddr::new(self.udp_ip_bind, udp_packet.source_addr.port())).await.unwrap_or(UdpSocket::bind(SocketAddr::new(self.udp_ip_bind, 0)).await.unwrap());
-                                let local_port = self.add_udp_sock(udp_sock_tmp, &mut udp_receivers);
-                                self.nat_table.insert(local_port, udp_packet.source_addr);
-                                self.udp_source_sockets.get(&local_port).unwrap()
-                        };
-                        tracing::debug!(n = len, "forward tcp packet to udp");
-                        send_sock.send_to(&udp_packet.data, SocketAddr::new(self.udp_ip_peer, udp_packet.target_port)).await;
+                        // let msg = &tail[..len];
+                        // let (udp_packet, _len): (UdpPacketWrapper, usize)  = bincode::decode_from_slice(msg, config).unwrap();
+                        // rest = &tail[len..];
+                        // let send_sock = if self.nat_table.contains_right(&udp_packet.source_addr) {
+                        //      self.udp_source_sockets.get(self.nat_table.get_by_right(&udp_packet.source_addr).unwrap()).unwrap() } else {
+                        //         let udp_sock_tmp = UdpSocket::bind(SocketAddr::new(self.udp_ip_bind, udp_packet.source_addr.port())).await.unwrap_or(UdpSocket::bind(SocketAddr::new(self.udp_ip_bind, 0)).await.unwrap());
+                        //         let local_port = self.add_udp_sock(udp_sock_tmp, &mut udp_receivers);
+                        //         self.nat_table.insert(local_port, udp_packet.source_addr);
+                        //         self.udp_source_sockets.get(&local_port).unwrap()
+                        // };
+                        // tracing::debug!(n = len, "forward tcp packet to udp");
+                        // send_sock.send_to(&udp_packet.data, SocketAddr::new(self.udp_ip_peer, udp_packet.target_port)).await;
                     }
 
                     if rest.is_empty() {
