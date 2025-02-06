@@ -61,7 +61,7 @@ impl UdpSockAccessor {
             .recv_from(&mut buf[..65535])
             .await
             .expect("UdpSocket::recv_from has no relevant error conditions");
-        println!("received UDP: {:?}", buf[..len].to_vec());
+        println!("received UDP: {}B from {}", len, source_addr);
         (self, buf, len, source_addr)
     }
 
@@ -207,7 +207,7 @@ impl UdpToTcp {
                         };
                         let bytes = bincode::encode_to_vec(&udp_packet, config).unwrap();
                         let len: u32 = bytes.len() as u32;
-                        tracing::debug!("forward udp packet to tcp: {:?}", udp_packet);
+                        tracing::debug!("forward udp packet to tcp: {}B from {} to port {}", udp_packet.data.len(), udp_packet.source_addr, udp_packet.target_port);
                         if let Err(e) = tcp_stream.write_all_buf(&mut Buf::chain(&len.to_le_bytes()[..], &bytes[..])).await {
                         // if let Err(e) = tcp_stream.write_all_buf(&mut Buf::chain(&len.to_le_bytes()[..], &len.to_le_bytes()[..])).await {
                             tracing::error!("dropping tcp connection after failed write: {e}");
@@ -251,7 +251,7 @@ impl UdpToTcp {
                                 self.nat_table.insert(local_port, udp_packet.source_addr);
                                 self.udp_source_sockets.get(&local_port).unwrap()
                         };
-                        tracing::debug!(n = len, "forward tcp packet to udp: {:?}", udp_packet);
+                        tracing::debug!("received udp packet over tcp: {}B from {} to port {}", udp_packet.data.len(), udp_packet.source_addr, udp_packet.target_port);
                         send_sock.send_to(&udp_packet.data, SocketAddr::new(self.udp_ip_peer, udp_packet.target_port)).await;
                     }
 
