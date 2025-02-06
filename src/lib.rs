@@ -42,23 +42,26 @@ struct UdpSockAccessor {
     sock: Arc<UdpSocket>,
 }
 
+type Buffer = [u8; 65536];
+
 impl UdpSockAccessor {
-    pub fn new(sock: UdpSocket) -> (Self, Vec<u8>) {
+    pub fn new(sock: UdpSocket) -> (Self, Buffer) {
         (
             UdpSockAccessor {
                 local_port: sock.local_addr().unwrap().port(),
                 sock: Arc::new(sock),
             },
-            Vec::with_capacity(65536),
+            [0_u8; 65536],
         )
     }
 
-    pub async fn recv_from(self, mut buf: Vec<u8>) -> (Self, Vec<u8>, usize, SocketAddr) {
+    pub async fn recv_from(self, mut buf: Buffer) -> (Self, Buffer, usize, SocketAddr) {
         let (len, source_addr) = self
             .sock
-            .recv_from(&mut buf)
+            .recv_from(&mut buf[..65535])
             .await
             .expect("UdpSocket::recv_from has no relevant error conditions");
+        println!("received UDP: {:?}", buf[..len].to_vec());
         (self, buf, len, source_addr)
     }
 
@@ -77,7 +80,7 @@ pub struct UdpToTcp {
     udp_ip_peer: IpAddr,
     nat_table: BiMap<u16, SocketAddr>,
     udp_source_sockets: FrozenMap<u16, Box<UdpSockAccessor>>,
-    udp_recv_socks: Option<JoinSet<(UdpSockAccessor, Vec<u8>, usize, SocketAddr)>>,
+    udp_recv_socks: Option<JoinSet<(UdpSockAccessor, Buffer, usize, SocketAddr)>>,
 }
 
 impl UdpToTcp {
@@ -101,7 +104,7 @@ impl UdpToTcp {
     fn add_udp_sock(
         &self,
         sock: UdpSocket,
-        udp_receivers: &mut JoinSet<(UdpSockAccessor, Vec<u8>, usize, SocketAddr)>,
+        udp_receivers: &mut JoinSet<(UdpSockAccessor, Buffer, usize, SocketAddr)>,
     ) -> u16 {
         let (udp_sock, udp_buf) = UdpSockAccessor::new(sock);
         let port = udp_sock.local_port;
@@ -112,7 +115,7 @@ impl UdpToTcp {
         port
     }
 
-    fn take_udp_receivers(&mut self) -> JoinSet<(UdpSockAccessor, Vec<u8>, usize, SocketAddr)> {
+    fn take_udp_receivers(&mut self) -> JoinSet<(UdpSockAccessor, Buffer, usize, SocketAddr)> {
         self.udp_recv_socks.take().unwrap()
     }
 
@@ -195,16 +198,16 @@ impl UdpToTcp {
                     tcp_buf.clear();
                 }
                 Some(res) = udp_receivers.join_next() => {
-                    let (recv_sock, mut buf, _len, source_addr): (UdpSockAccessor, Vec<u8>, usize, SocketAddr) = res.unwrap();
+                    let (recv_sock, mut buf, len, source_addr): (UdpSockAccessor, Buffer, usize, SocketAddr) = res.unwrap();
                     if let Some(tcp_stream) = &mut tcp {
                         let udp_packet = UdpPacketWrapper{
-                            data: buf.to_vec(),
+                            data: buf[..len].to_vec(),
                             source_addr,
                             target_port: recv_sock.local_port,
                         };
                         let bytes = bincode::encode_to_vec(&udp_packet, config).unwrap();
                         let len: u32 = bytes.len() as u32;
-                        tracing::debug!("forward udp packet to tcp");
+                        tracing::debug!("forward udp packet to tcp: {:?}", udp_packet);
                         if let Err(e) = tcp_stream.write_all_buf(&mut Buf::chain(&len.to_le_bytes()[..], &bytes[..])).await {
                         // if let Err(e) = tcp_stream.write_all_buf(&mut Buf::chain(&len.to_le_bytes()[..], &len.to_le_bytes()[..])).await {
                             tracing::error!("dropping tcp connection after failed write: {e}");
@@ -213,7 +216,6 @@ impl UdpToTcp {
                             tracing::error!("dropping tcp connection after failed flush: {e}");
                             tcp = None;
                         }
-                        buf.clear();
                     } else {
                         tracing::debug!("dropping udp packet without a tcp peer");
                     }
@@ -229,8 +231,6 @@ impl UdpToTcp {
 
                     let mut rest = &tcp_buf[..];
                     loop {
-                        tracing::debug!("recv buffer: {}", from_utf8_lossy(rest));
-                        tracing::debug!("recv buffer bin: {:?}", rest);
                         if rest.len() < std::mem::size_of::<u32>() {
                             break;
                         }
@@ -244,7 +244,8 @@ impl UdpToTcp {
                         let (udp_packet, _len): (UdpPacketWrapper, usize)  = bincode::decode_from_slice(msg, config).unwrap();
                         rest = &tail[len..];
                         let send_sock = if self.nat_table.contains_right(&udp_packet.source_addr) {
-                             self.udp_source_sockets.get(self.nat_table.get_by_right(&udp_packet.source_addr).unwrap()).unwrap() } else {
+                             self.udp_source_sockets.get(self.nat_table.get_by_right(&udp_packet.source_addr).unwrap()).unwrap()
+                        } else {
                                 let udp_sock_tmp = UdpSocket::bind(SocketAddr::new(self.udp_ip_bind, udp_packet.source_addr.port())).await.unwrap_or(UdpSocket::bind(SocketAddr::new(self.udp_ip_bind, 0)).await.unwrap());
                                 let local_port = self.add_udp_sock(udp_sock_tmp, &mut udp_receivers);
                                 self.nat_table.insert(local_port, udp_packet.source_addr);
