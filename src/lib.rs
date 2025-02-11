@@ -60,7 +60,7 @@ impl UdpSockAccessor {
             .recv_from(&mut buf[..65535])
             .await
             .expect("UdpSocket::recv_from has no relevant error conditions");
-        println!("received UDP: {}B from {}", len, source_addr);
+        tracing::debug!("received UDP: {}B from {}", len, source_addr);
         (self, buf, len, source_addr)
     }
 
