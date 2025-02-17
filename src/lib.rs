@@ -9,7 +9,6 @@ use bincode::{config, Decode, Encode};
 use bytes::Buf;
 use elsa::FrozenMap;
 use lexopt::ValueExt;
-use serde::__private::from_utf8_lossy;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::select;
@@ -198,7 +197,7 @@ impl UdpToTcp {
                     tcp_buf.clear();
                 }
                 Some(res) = udp_receivers.join_next() => {
-                    let (recv_sock, mut buf, len, source_addr): (UdpSockAccessor, Buffer, usize, SocketAddr) = res.unwrap();
+                    let (recv_sock, buf, len, source_addr): (UdpSockAccessor, Buffer, usize, SocketAddr) = res.unwrap();
                     if let Some(tcp_stream) = &mut tcp {
                         let udp_packet = UdpPacketWrapper{
                             data: buf[..len].to_vec(),
