@@ -3,7 +3,8 @@ use std::net::Ipv4Addr;
 use eyre::WrapErr;
 use lexopt::prelude::*;
 
-use udp_over_tcp::{port_or_addr, UdpToTcp};
+use udp_over_tcp::port_or_addr;
+use udp_over_tcp::UdpToTcp;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> eyre::Result<()> {
