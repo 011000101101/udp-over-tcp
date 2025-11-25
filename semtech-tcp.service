@@ -1,0 +1,12 @@
+[Unit]
+Description=udp to tcp wrapper for the semtech udp connection
+Wants=lora_pkt_fwd.service
+
+[Service]
+ExecStart=/home/vmechler-local/udp-over-tcp-main/target/release/udp-over-tcp --tcp-listen=1731 --udp-bind=1730 --udp-sendto=34658
+Environment="RUST_LOG=debug"
+User=vmechler-local
+Group=vmechler-local
+
+[Install]
+WantedBy=multi-user.target
